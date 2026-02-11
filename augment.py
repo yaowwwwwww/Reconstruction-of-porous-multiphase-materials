@@ -104,54 +104,24 @@ def rotate_z_inv(theta, **kwargs):
     return rotate_z(-theta, **kwargs)
 
 # -------------------------- 2.2D形态学操作核心函数 --------------------------
-def get_morph_kernel_2d(kernel_size=3, device=None):
-    """创建2D十字形结构元素（适配切片处理，与原3D核的切片逻辑一致）"""
-    kernel = torch.zeros((kernel_size, kernel_size), device=device)
-    center = kernel_size // 2
-    # 水平中线（对应3D核的x方向切片）
-    kernel[center, :] = 1.0
-    # 垂直中线（对应3D核的y方向切片）
-    kernel[:, center] = 1.0
-    return kernel
+def erode_cross_2d(x, kernel_size):
+    """Vectorized 2D cross erosion for a batch of slices [N, C, H, W]."""
+    padding = kernel_size // 2
+    x_h = F.pad(x, (padding, padding, 0, 0), mode='reflect')
+    x_v = F.pad(x, (0, 0, padding, padding), mode='reflect')
+    min_h = -F.max_pool2d(-x_h, kernel_size=(1, kernel_size), stride=1)
+    min_v = -F.max_pool2d(-x_v, kernel_size=(kernel_size, 1), stride=1)
+    return torch.minimum(min_h, min_v)
 
 
-def erode_cross_2d(x, kernel):
-    """2D十字形腐蚀（单切片处理，复用原3D操作的2D核心逻辑）"""
-    padding = kernel.shape[0] // 2
-    # 2D反射边界填充（匹配原3D的边界模式）
-    x_pad = F.pad(x, (padding, padding, padding, padding), mode='reflect')
-
-    # 提取局部区域（仅处理2D维度）
-    unfold = F.unfold(x_pad, kernel_size=kernel.shape, stride=1)
-    batch_size, channels, height, width = x.shape
-    k = kernel.numel()
-    unfold = unfold.view(batch_size, channels, k, height, width)
-
-    # 核筛选与最小值计算（与原3D逻辑完全一致）
-    kernel_flat = kernel.flatten()
-    valid_mask = (kernel_flat == 1.0).float()
-    valid_pixels = unfold * valid_mask[None, None, :, None, None]
-    valid_pixels = valid_pixels.masked_fill(valid_mask[None, None, :, None, None] == 0, float('inf'))
-    return torch.min(valid_pixels, dim=2)[0]
-
-
-def dilate_cross_2d(x, kernel):
-    """2D十字形膨胀（单切片处理，复用原3D操作的2D核心逻辑）"""
-    padding = kernel.shape[0] // 2
-    x_pad = F.pad(x, (padding, padding, padding, padding), mode='reflect')
-
-    # 提取局部区域（仅处理2D维度）
-    unfold = F.unfold(x_pad, kernel_size=kernel.shape, stride=1)
-    batch_size, channels, height, width = x.shape
-    k = kernel.numel()
-    unfold = unfold.view(batch_size, channels, k, height, width)
-
-    # 核筛选与最大值计算（与原3D逻辑完全一致）
-    kernel_flat = kernel.flatten()
-    valid_mask = (kernel_flat == 1.0).float()
-    valid_pixels = unfold * valid_mask[None, None, :, None, None]
-    valid_pixels = valid_pixels.masked_fill(valid_mask[None, None, :, None, None] == 0, float('-inf'))
-    return torch.max(valid_pixels, dim=2)[0]
+def dilate_cross_2d(x, kernel_size):
+    """Vectorized 2D cross dilation for a batch of slices [N, C, H, W]."""
+    padding = kernel_size // 2
+    x_h = F.pad(x, (padding, padding, 0, 0), mode='reflect')
+    x_v = F.pad(x, (0, 0, padding, padding), mode='reflect')
+    max_h = F.max_pool2d(x_h, kernel_size=(1, kernel_size), stride=1)
+    max_v = F.max_pool2d(x_v, kernel_size=(kernel_size, 1), stride=1)
+    return torch.maximum(max_h, max_v)
 
 
 # -------------------------- 3.差异化高斯扰动 --------------------------
@@ -284,7 +254,6 @@ class AugmentPipe3D(nn.Module):
         self.erode_prob = erode_prob
         self.dilate_prob = dilate_prob
         self.morph_kernel_size = morph_kernel_size
-        self.morph_kernel = None  # 延迟初始化核
 
         # 差异化高斯扰动参数（替换原max_perturb）
         self.numeric_perturb_prob = numeric_perturb_prob
@@ -379,10 +348,6 @@ class AugmentPipe3D(nn.Module):
 
         ############################# 2. 3D→2D切片形态学操作#############################
         if (self.erode_prob > 0 or self.dilate_prob > 0) and self.p > 0:
-            # 初始化2D十字形核（适配切片处理）
-            if self.morph_kernel is None:
-                self.morph_kernel = get_morph_kernel_2d(self.morph_kernel_size, device)
-
             # 1. 筛选需要应用形态学操作的样本
             total_morph_prob = (self.erode_prob + self.dilate_prob) * self.p
             morph_mask = torch.rand(batch_size, device=device) < total_morph_prob  # [B]，标记需处理的样本
@@ -392,45 +357,33 @@ class AugmentPipe3D(nn.Module):
                 total_prob = self.erode_prob + self.dilate_prob
                 erode_weight = self.erode_prob / total_prob if total_prob > 0 else 0.5
 
-                # 创建输出副本
                 volumes_out = volumes.clone()
+                selected_idx = torch.nonzero(morph_mask, as_tuple=False).squeeze(1)
+                selected_count = selected_idx.numel()
 
-                # 2. 为每个需处理的样本确定操作类型（整个3D体统一操作）
-                # 为每个样本生成一次操作类型，而非每个切片
-                operation_type = torch.where(
-                    torch.rand(batch_size, device=device) < erode_weight,
-                    torch.tensor(0, device=device),  # 0表示腐蚀
-                    torch.tensor(1, device=device)  # 1表示膨胀
-                )
+                # 为每个样本生成一次操作类型（整个3D体统一操作）
+                op_is_erode = torch.rand(selected_count, device=device) < erode_weight
 
-                # 3. 对每个需处理的样本执行操作
-                for i in range(batch_size):
-                    if morph_mask[i]:
-                        # 获取当前样本的操作类型（整个3D体统一）
-                        is_erode = operation_type[i] == 0
+                # 2. 对选中的样本做批量向量化形态学处理
+                if op_is_erode.any():
+                    erode_idx = selected_idx[op_is_erode]
+                    erode_vol = volumes[erode_idx]
+                    erode_flat = erode_vol.permute(0, 2, 1, 3, 4).reshape(-1, num_channels, height, width)
+                    erode_flat = erode_cross_2d(erode_flat, self.morph_kernel_size)
+                    erode_vol = erode_flat.reshape(erode_idx.numel(), depth, num_channels, height, width).permute(
+                        0, 2, 1, 3, 4
+                    )
+                    volumes_out[erode_idx] = erode_vol
 
-                        # 提取单个样本的3D数据
-                        single_volume = volumes[i:i + 1]
-                        batch, ch, d, h, w = single_volume.shape
-                        processed_slices = []
-
-                        # 4. 对所有切片执行相同操作
-                        for z in range(d):
-                            # 提取2D切片
-                            slice_2d = single_volume[:, :, z:z + 1, :, :].squeeze(2)
-
-                            # 对当前切片执行与整个3D体相同的操作
-                            if is_erode:
-                                processed_slice = erode_cross_2d(slice_2d, self.morph_kernel)
-                            else:
-                                processed_slice = dilate_cross_2d(slice_2d, self.morph_kernel)
-
-                            # 恢复深度维度并收集
-                            processed_slices.append(processed_slice.unsqueeze(2))
-
-                        # 5. 合并所有切片为3D数据
-                        merged_3d = torch.cat(processed_slices, dim=2)
-                        volumes_out[i:i + 1] = merged_3d
+                if (~op_is_erode).any():
+                    dilate_idx = selected_idx[~op_is_erode]
+                    dilate_vol = volumes[dilate_idx]
+                    dilate_flat = dilate_vol.permute(0, 2, 1, 3, 4).reshape(-1, num_channels, height, width)
+                    dilate_flat = dilate_cross_2d(dilate_flat, self.morph_kernel_size)
+                    dilate_vol = dilate_flat.reshape(dilate_idx.numel(), depth, num_channels, height, width).permute(
+                        0, 2, 1, 3, 4
+                    )
+                    volumes_out[dilate_idx] = dilate_vol
 
                 # 更新为处理后的结果
                 volumes = volumes_out
