@@ -27,6 +27,17 @@ class PorosityDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.paths)
 
+    def _normalize_uint8_volume(self, volume: torch.Tensor, raw_values: np.ndarray) -> torch.Tensor:
+        unique_vals = np.unique(raw_values)
+        if unique_vals.size <= 2 and np.all(np.isin(unique_vals, [0, 1])):
+            volume = volume * 2.0 - 1.0
+        elif unique_vals.size <= 2 and np.all(np.isin(unique_vals, [0, 255])):
+            volume = (volume / 255.0) * 2.0 - 1.0
+        else:
+            # Fallback for generic grayscale uint8 input.
+            volume = volume / 127.5 - 1.0
+        return torch.clamp(volume, min=-1.0, max=1.0)
+
     def __getitem__(self, index: int) -> torch.Tensor:
         file_path = self.paths[index]
 
@@ -41,13 +52,19 @@ class PorosityDataset(torch.utils.data.Dataset):
         with open(file_path, 'rb') as f:
             data = np.fromfile(f, dtype=dtype)
 
+        expected_size = self.volume_size * self.volume_size * self.volume_size
+        if data.size != expected_size:
+            raise ValueError(
+                f"Unexpected voxel count for {file_path}: got {data.size}, expected {expected_size}."
+            )
+
         # 重塑为[1,64,64,64]
         volume = data.reshape(1, self.volume_size, self.volume_size, self.volume_size)
         volume = torch.from_numpy(volume).float()
 
         # 仅对真实数据进行归一化（0→-1，1→1）
         if dtype == np.uint8:
-            volume = (volume - 0.5) / 0.5  # 真实数据uint8需要归一化
+            volume = self._normalize_uint8_volume(volume, data)
 
         # 生成数据已经是[-1,1]范围，无需再次归一化
         return volume
