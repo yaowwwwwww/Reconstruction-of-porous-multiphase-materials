@@ -1,11 +1,13 @@
 # 修改loss保存逻辑，使多次训练的loss都能保存到同一CSV文件
 
 import matplotlib
+import argparse
 matplotlib.use('Agg')  # 非交互式后端
 import os
 import csv
 import math
 import time
+from pathlib import Path
 from typing import Tuple
 import torch
 import torch.utils.data
@@ -16,16 +18,11 @@ from utils import cycle_dataloader, PorosityDataset, DiscriminatorLoss, Generato
 from MetricChecker import MetricChecker
 
 # 创建保存结果的文件夹
-os.makedirs('results', exist_ok=True)
-os.makedirs('results/losses', exist_ok=True)
-os.makedirs('results/slices', exist_ok=True)  # 保存2D切片可视化
-os.makedirs('results/checkpoints', exist_ok=True)
 
 # 定义损失CSV路径（移除初始化写入表头的逻辑，改为在save_losses中处理）
-loss_csv_path = os.path.join('results', 'losses', 'training_losses.csv')
 
 class Configs:
-    def __init__(self):
+    def __init__(self, args: argparse.Namespace):
         # 设备配置
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -61,9 +58,9 @@ class Configs:
         self.loader = None
 
         # 3D训练超参数
-        self.batch_size: int = 100
+        self.batch_size: int = args.batch_size
         self.d_latent: int = 128
-        self.volume_size: int = 64
+        self.volume_size: int = args.volume_size
         self.mapping_network_layers: int = 4
         self.learning_rate: float = 1e-3
         self.mapping_network_learning_rate: float = 1e-5
@@ -71,7 +68,7 @@ class Configs:
         # beta1=0 表示不累积历史梯度的一阶矩信息，beta2=0.99表示二阶矩估计会保留 99% 的历史信息
         self.adam_betas: Tuple[float, float] = (0, 0.99)
         self.style_mixing_prob: float = 0
-        self.training_steps: int = 500_000
+        self.training_steps: int = args.training_steps
         self.n_gen_blocks: int = 0
 
         ### ADA相关参数
@@ -92,18 +89,48 @@ class Configs:
         self.metric_check_sample_num: int = 200  # 每次检查生成200个样本
 
         ## 数据集路径
-        self.dataset_path: str = '/scratch/wuwen123/yang/annotated_deep_learning_paper_implementations/labml_nn/gan/DATA/Bentheimer_64(200)'
-        self.val_dataset_path: str = ''
+        self.dataset_path: str = args.dataset_path
+        self.val_dataset_path: str = args.val_dataset_path
+        self.num_workers: int = args.num_workers
+        self.pin_memory: bool = args.pin_memory
 
         ## 检查点路径（用于续训）
-        self.resume_checkpoint_path = os.path.join('results', 'checkpoints', 'ckpt_step_10900.pth')
+        self.resume: bool = args.resume
+        self.resume_checkpoint_path: str = args.resume_checkpoint_path
+
+        ## 输出路径
+        self.results_dir: str = args.results_dir
+        self.losses_dir = os.path.join(self.results_dir, 'losses')
+        self.slices_dir = os.path.join(self.results_dir, 'slices')
+        self.checkpoints_dir = os.path.join(self.results_dir, 'checkpoints')
+        self.loss_csv_path = os.path.join(self.losses_dir, 'training_losses.csv')
+        self._prepare_output_dirs()
 
         # 指标检查器
         self.metric_checker = None
 
-    def load_checkpoint(self):
+    def _prepare_output_dirs(self):
+        os.makedirs(self.results_dir, exist_ok=True)
+        os.makedirs(self.losses_dir, exist_ok=True)
+        os.makedirs(self.slices_dir, exist_ok=True)
+        os.makedirs(self.checkpoints_dir, exist_ok=True)
+
+    def _find_latest_checkpoint(self):
+        checkpoint_paths = list(Path(self.checkpoints_dir).glob('ckpt_step_*.pth'))
+        if not checkpoint_paths:
+            return None
+
+        def _extract_step(path: Path):
+            try:
+                return int(path.stem.rsplit('_', 1)[-1])
+            except ValueError:
+                return -1
+
+        return str(max(checkpoint_paths, key=_extract_step))
+
+    def load_checkpoint(self, checkpoint_path: str):
         """加载检查点，用于续训"""
-        checkpoint = torch.load(self.resume_checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.generator.load_state_dict(checkpoint['generator'])
         self.discriminator.load_state_dict(checkpoint['discriminator'])
         self.mapping_network.load_state_dict(checkpoint['mapping_network'])
@@ -116,7 +143,7 @@ class Configs:
             self.augment_pipe.load_state_dict(checkpoint['augment_pipe_state'])
 
         start_step = checkpoint['step']
-        print(f"Loaded checkpoint from step {start_step}. Resuming training...")
+        print(f"Loaded checkpoint from {checkpoint_path}, step {start_step}. Resuming training...")
         return start_step
 
     def get_w(self, batch_size: int):
@@ -171,10 +198,10 @@ class Configs:
     def save_losses(self, step, disc_loss, gen_loss, gp=None, transition_penalty=None, augment_p=None, ada_signal=None, porosity_mean=None):
         """保存损失值到CSV文件（支持续训/多次运行追加写入）"""
         # 检查文件是否存在且非空
-        file_exists = os.path.isfile(loss_csv_path)
-        file_is_empty = file_exists and os.path.getsize(loss_csv_path) == 0
+        file_exists = os.path.isfile(self.loss_csv_path)
+        file_is_empty = file_exists and os.path.getsize(self.loss_csv_path) == 0
 
-        with open(loss_csv_path, 'a', newline='', encoding='utf-8') as f:
+        with open(self.loss_csv_path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             # 仅当文件不存在或为空时写入表头
             if not file_exists or file_is_empty:
@@ -221,7 +248,7 @@ class Configs:
             plt.axis('off')
 
         plt.tight_layout()
-        slice_path = os.path.join('results', 'slices', f'slice_step_{step}.png')
+        slice_path = os.path.join(self.slices_dir, f'slice_step_{step}.png')
         plt.savefig(slice_path, dpi=300)
         plt.close()
 
@@ -237,7 +264,7 @@ class Configs:
             'm_optim': self.mapping_network_optimizer.state_dict(),
             'augment_pipe_state': self.augment_pipe.state_dict(),  ### 保存ADA状态
         }
-        torch.save(checkpoint, os.path.join('results', 'checkpoints', f'ckpt_step_{step}.pth'))
+        torch.save(checkpoint, os.path.join(self.checkpoints_dir, f'ckpt_step_{step}.pth'))
 
     def init(self):
         # 初始化数据集和数据加载器
@@ -245,10 +272,10 @@ class Configs:
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=self.batch_size,
-            num_workers=8,
+            num_workers=self.num_workers,
             shuffle=True,
             drop_last=True,
-            pin_memory=True
+            pin_memory=self.pin_memory
         )
         self.loader = cycle_dataloader(dataloader)
 
@@ -303,13 +330,17 @@ class Configs:
         self.metric_checker = MetricChecker(
             real_dir=self.dataset_path,
             shape=(self.volume_size, self.volume_size, self.volume_size),
-            results_dir='results'
+            results_dir=self.results_dir
         )
 
         # 检查是否存在检查点，存在则加载
         start_step = 0
-        if os.path.exists(self.resume_checkpoint_path):
-            start_step = self.load_checkpoint()
+        if self.resume:
+            checkpoint_path = self.resume_checkpoint_path or self._find_latest_checkpoint()
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                start_step = self.load_checkpoint(checkpoint_path)
+            else:
+                print("Resume requested, but no checkpoint was found. Training will start from step 0.")
 
         return start_step
 
@@ -439,6 +470,8 @@ class Configs:
         print(f"Training steps: {self.training_steps}")
         print(f"体积尺寸: {self.volume_size}x{self.volume_size}x{self.volume_size}")
         print(f"批次大小: {self.batch_size}, 总步数: {self.training_steps}")
+        print(f"Dataset path: {self.dataset_path}")
+        print(f"Results dir: {self.results_dir}")
         print(f"ADA Target: {self.ada_target}, Adjust Interval: {self.ada_adjust_interval}")
         print(f"指标检查: 从 {self.metric_check_start_step} 步开始，每 {self.metric_check_interval} 步一次")
 
@@ -457,6 +490,28 @@ class Configs:
                       )
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train CY-PNMGAN on 3D porous volumes.")
+    parser.add_argument('--dataset-path', required=True, help='Path to training .raw files.')
+    parser.add_argument('--val-dataset-path', default='', help='Optional validation dataset path.')
+    parser.add_argument('--results-dir', default='results', help='Directory for checkpoints, logs, and figures.')
+    parser.add_argument('--resume', action='store_true', help='Resume training from a checkpoint.')
+    parser.add_argument(
+        '--resume-checkpoint-path',
+        default='',
+        help='Checkpoint path for resume. If empty and --resume is set, latest checkpoint in results dir is used.'
+    )
+    parser.add_argument('--training-steps', type=int, default=500_000, help='Total training steps.')
+    parser.add_argument('--batch-size', type=int, default=100, help='Batch size for training.')
+    parser.add_argument('--num-workers', type=int, default=8, help='DataLoader worker count.')
+    parser.add_argument('--volume-size', type=int, default=64, help='Input volume edge length.')
+    parser.set_defaults(pin_memory=torch.cuda.is_available())
+    parser.add_argument('--pin-memory', dest='pin_memory', action='store_true', help='Enable DataLoader pin_memory.')
+    parser.add_argument('--no-pin-memory', dest='pin_memory', action='store_false', help='Disable pin_memory.')
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    config = Configs()
+    args = parse_args()
+    config = Configs(args)
     config.train()
